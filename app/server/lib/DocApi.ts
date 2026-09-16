@@ -1,5 +1,4 @@
 import { concatenateSummaries, summarizeAction } from "app/common/ActionSummarizer";
-import { createEmptyActionSummary } from "app/common/ActionSummary";
 import { QueryFilters } from "app/common/ActiveDocAPI";
 import { ApiError } from "app/common/ApiError";
 import { BrowserSettings } from "app/common/BrowserSettings";
@@ -8,6 +7,7 @@ import {
   fromTableDataAction,
   TableColValues,
   TableRecordValue,
+  toTableDataAction,
   UserAction,
 } from "app/common/DocActions";
 import { DocData } from "app/common/DocData";
@@ -22,7 +22,9 @@ import {
   isRaisedException,
 } from "app/common/gristTypes";
 import { buildUrlId, parseUrlId, SHARE_KEY_PREFIX } from "app/common/gristUrls";
-import { isAffirmative, safeJsonParse } from "app/common/gutil";
+import { isAffirmative, isNonNullish, safeJsonParse } from "app/common/gutil";
+import { compilePredicateFormula, getPredicateFormulaProperties } from "app/common/PredicateFormula";
+import { EmptyRecordView, RecordView } from "app/common/RecordView";
 import { schema, SchemaTypes } from "app/common/schema";
 import { MetaRowRecord, MetaTableData } from "app/common/TableData";
 import {
@@ -174,13 +176,20 @@ export class DocWorkerApi {
     const requireInstallAdmin = this._grist.getInstallAdmin().getMiddlewareRequireAdmin();
 
     // check document exists (not soft deleted) and user can view it
-    const canView = expressWrap(this._assertAccess.bind(this, "viewers", false));
+    const canView = expressWrap(this._assertAccess.bind(this, "viewers", {}));
     // check document exists (not soft deleted) and user can edit it
-    const canEdit = expressWrap(this._assertAccess.bind(this, "editors", false));
+    const canEdit = expressWrap(this._assertAccess.bind(this, "editors", {}));
+    // as canEdit, for operations that leave the document unchanged, such as reloading it.
+    // These stay available while the document is held read-only.
+    const canEditNotWriting = expressWrap(this._assertAccess.bind(this, "editors", { writes: false }));
     const checkAnonymousCreation = expressWrap(this._checkAnonymousCreation.bind(this));
-    const isOwner = expressWrap(this._assertAccess.bind(this, "owners", false));
+    // Owner access says nothing about whether an endpoint writes, so owner-only endpoints
+    // say which they are. Reads stay available while the document is held read-only.
+    const isOwnerRead = expressWrap(this._assertAccess.bind(this, "owners", {}));
+    const isOwnerWrite = expressWrap(this._assertAccess.bind(this, "owners", { writes: true }));
     // check user can edit document, with soft-deleted and disabled documents being acceptable
-    const canEditMaybeRemovedOrDisabled = expressWrap(this._assertAccess.bind(this, "editors", true));
+    const canEditMaybeRemovedOrDisabled =
+      expressWrap(this._assertAccess.bind(this, "editors", { allowRemovedOrDisabled: true }));
     // converts google code to access token and adds it to request object
     const decodeGoogleToken = expressWrap(googleAuthTokenMiddleware.bind(null));
 
@@ -354,11 +363,12 @@ export class DocWorkerApi {
     }));
 
     // Starts transferring all attachments to the named store, if it exists.
-    this._app.post("/api/docs/:docId/attachments/transferAll", isOwner, withDoc(async (activeDoc, req, res) => {
-      await activeDoc.startTransferringAllAttachmentsToDefaultStore();
-      // Respond with the current status to allow for immediate UI updates.
-      res.json(await activeDoc.attachmentTransferStatus());
-    }));
+    this._app.post("/api/docs/:docId/attachments/transferAll", isOwnerWrite,
+      withDoc(async (activeDoc, req, res) => {
+        await activeDoc.startTransferringAllAttachmentsToDefaultStore();
+        // Respond with the current status to allow for immediate UI updates.
+        res.json(await activeDoc.attachmentTransferStatus());
+      }));
 
     // Returns the status of any current / pending attachment transfers
     this._app.get("/api/docs/:docId/attachments/transferStatus", canView, withDoc(async (activeDoc, req, res) => {
@@ -374,7 +384,7 @@ export class DocWorkerApi {
       }),
     );
 
-    this._app.post("/api/docs/:docId/attachments/store", isOwner, validate(SetAttachmentStorePost),
+    this._app.post("/api/docs/:docId/attachments/store", isOwnerWrite, validate(SetAttachmentStorePost),
       withDoc(async (activeDoc, req, res) => {
         const body = req.body as Types.SetAttachmentStorePost;
         if (body.type === "internal") {
@@ -396,7 +406,7 @@ export class DocWorkerApi {
       }),
     );
 
-    this._app.get("/api/docs/:docId/attachments/stores", isOwner,
+    this._app.get("/api/docs/:docId/attachments/stores", isOwnerRead,
       withDoc(async (activeDoc, req, res) => {
         const configs = this._attachmentStoreProvider.listAllConfigs();
         const labels: Types.AttachmentStoreDesc[] = configs.map(c => ({ label: c.label }));
@@ -447,7 +457,7 @@ export class DocWorkerApi {
       res.end();
     }));
 
-    this._app.post("/api/docs/:docId/attachments/archive", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/attachments/archive", isOwnerWrite, withDoc(async (activeDoc, req, res) => {
       let archivePromise: Promise<ArchiveUploadResult> | undefined;
 
       await parseMultipartFormRequest(
@@ -527,16 +537,17 @@ export class DocWorkerApi {
       await activeDoc.updateUsedAttachmentsIfNeeded();
       res.json(null);
     }));
-    this._app.post("/api/docs/:docId/attachments/removeUnused", isOwner, withDoc(async (activeDoc, req, res) => {
-      const expiredOnly = isAffirmative(req.query.expiredonly);
-      const verifyFiles = isAffirmative(req.query.verifyfiles);
-      await activeDoc.removeUnusedAttachments(expiredOnly);
-      if (verifyFiles) {
-        await verifyAttachmentFiles(activeDoc);
-      }
-      res.json(null);
-    }));
-    this._app.post("/api/docs/:docId/attachments/verifyFiles", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/attachments/removeUnused", isOwnerWrite,
+      withDoc(async (activeDoc, req, res) => {
+        const expiredOnly = isAffirmative(req.query.expiredonly);
+        const verifyFiles = isAffirmative(req.query.verifyfiles);
+        await activeDoc.removeUnusedAttachments(expiredOnly);
+        if (verifyFiles) {
+          await verifyAttachmentFiles(activeDoc);
+        }
+        res.json(null);
+      }));
+    this._app.post("/api/docs/:docId/attachments/verifyFiles", isOwnerRead, withDoc(async (activeDoc, req, res) => {
       await verifyAttachmentFiles(activeDoc);
       res.json(null);
     }));
@@ -868,7 +879,7 @@ export class DocWorkerApi {
 
     // Reload a document forcibly (in fact this closes the doc, it will be automatically
     // reopened on use).
-    this._app.post("/api/docs/:docId/force-reload", canEdit, async (req, res) => {
+    this._app.post("/api/docs/:docId/force-reload", canEditNotWriting, async (req, res) => {
       const mreq = req as RequestWithLogin;
       const activeDoc = await this._getActiveDoc(mreq);
       const document = activeDoc.doc || { id: activeDoc.docName };
@@ -928,12 +939,12 @@ export class DocWorkerApi {
       res.json({ snapshots });
     }));
 
-    this._app.get("/api/docs/:docId/usersForViewAs", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.get("/api/docs/:docId/usersForViewAs", isOwnerRead, withDoc(async (activeDoc, req, res) => {
       const docSession = docSessionFromRequest(req);
       res.json(await activeDoc.getUsersForViewAs(docSession));
     }));
 
-    this._app.post("/api/docs/:docId/snapshots/remove", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/snapshots/remove", isOwnerWrite, withDoc(async (activeDoc, req, res) => {
       const docSession = docSessionFromRequest(req);
       const snapshotIds = req.body.snapshotIds as string[];
       if (snapshotIds) {
@@ -963,7 +974,7 @@ export class DocWorkerApi {
       throw new Error("please specify snapshotIds to remove");
     }));
 
-    this._app.post("/api/docs/:docId/flush", canEdit, throttled(async (req, res) => {
+    this._app.post("/api/docs/:docId/flush", canEditNotWriting, throttled(async (req, res) => {
       const activeDocPromise = this._getActiveDocIfAvailable(req);
       if (!activeDocPromise) {
         // Only need to flush if doc is actually open.
@@ -983,7 +994,7 @@ export class DocWorkerApi {
     // Optionally accepts a `group` query param for updating the document's group prior
     // to (possible) reassignment. A blank string unsets the current group, if any.
     // (Requires a special permit.)
-    this._app.post("/api/docs/:docId/assign", canEdit, throttled(async (req, res) => {
+    this._app.post("/api/docs/:docId/assign", canEditNotWriting, throttled(async (req, res) => {
       const docId = getDocId(req);
       const group = optStringParam(req.query.group, "group");
       if (group !== undefined && req.specialPermit?.action === "assign-doc") {
@@ -1074,7 +1085,7 @@ export class DocWorkerApi {
       res.json(await this._getStates(docSession, activeDoc));
     }));
 
-    this._app.post("/api/docs/:docId/states/remove", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/states/remove", isOwnerWrite, withDoc(async (activeDoc, req, res) => {
       const docSession = docSessionFromRequest(req);
       const keep = integerParam(req.body.keep, "keep");
       await activeDoc.deleteActions(docSession, keep);
@@ -1453,8 +1464,19 @@ export class DocWorkerApi {
         }
 
         // Cache the table reads based on tableId. We are caching only the promise, not the result.
-        const table = _.memoize((tableId: string) =>
-          readTable(req, activeDoc, tableId, {}, {}).then(r => asRecords(r, { includeId: true })));
+        const tableData = _.memoize((tableId: string) =>
+          readTable(req, activeDoc, tableId, {}, {}));
+        // Keep returned reference values scoped to the caller/share, while published-share
+        // predicates may inspect condition-only columns without exposing those columns publicly.
+        const predicateTableData = _.memoize(async (tableId: string) => {
+          if (!linkId) { return tableData(tableId); }
+
+          const { tableData: fullTableData } = await handleSandboxError(
+            tableId, [], activeDoc.fetchTable(makeExceptionalDocSession("system"), tableId, true));
+          return fromTableDataAction(fullTableData);
+        });
+        const table = _.memoize(async (tableId: string) =>
+          asRecords(await tableData(tableId), { includeId: true }));
 
         const getTableValues = async (tableId: string, colId: string) => {
           const records = await table(tableId);
@@ -1463,7 +1485,10 @@ export class DocWorkerApi {
 
         const Tables = metaTable("_grist_Tables");
 
-        const getRefTableValues = async (col: MetaRowRecord<"_grist_Tables_column">) => {
+        const getRefTableValues = async (
+          col: MetaRowRecord<"_grist_Tables_column">,
+          options: { dropdownCondition?: { parsed?: string } },
+        ) => {
           const refTableId = getReferencedTableId(col.type);
           let refColId: string;
           if (col.visibleCol) {
@@ -1476,8 +1501,35 @@ export class DocWorkerApi {
           }
           if (!refTableId || typeof refTableId !== "string" || !refColId) { return []; }
 
-          const values = await getTableValues(refTableId, refColId);
-          return values.filter(([_id, value]) => !isBlankValue(value));
+          const values = (await getTableValues(refTableId, refColId))
+            .filter(([_id, value]) => !isBlankValue(value));
+          const dropdownCondition = options.dropdownCondition;
+          if (!dropdownCondition?.parsed) { return values; }
+
+          try {
+            const parsed = JSON.parse(dropdownCondition.parsed);
+            const { recColIds } = getPredicateFormulaProperties(parsed);
+
+            // A published form represents a new record whose current field values live only in
+            // the browser. Conditions depending on `rec` / `$col` therefore need a dynamic
+            // options endpoint; preserve the current behavior for those conditions for now.
+            if (recColIds?.length) { return values; }
+
+            const predicate = compilePredicateFormula(parsed, { variant: "dropdown-condition" });
+            const user = (await activeDoc.getUser(docSession)).toUserInfo();
+            const refTableData = toTableDataAction(refTableId, await predicateTableData(refTableId));
+            const rowIndexes = new Map(refTableData[2].map((rowId, index) => [rowId, index]));
+
+            return values.filter(([id]) => {
+              const rowIndex = rowIndexes.get(id);
+              if (rowIndex === undefined) { return false; }
+
+              return predicate({ user, rec: new EmptyRecordView(), choice: new RecordView(refTableData, rowIndex) });
+            });
+          } catch {
+            // Match the regular reference editor's fail-closed behavior for invalid conditions.
+            return [];
+          }
         };
 
         const formFields = await Promise.all(fields.map(async (field) => {
@@ -1496,7 +1548,7 @@ export class DocWorkerApi {
             question: options.question || col.label || colId,
             options,
             type,
-            refValues: isFullReferencingType(col.type) ? await getRefTableValues(col) : null,
+            refValues: isFullReferencingType(col.type) ? await getRefTableValues(col, options) : null,
           }] as const;
         }));
         const formFieldsById = Object.fromEntries(formFields);
@@ -1531,7 +1583,7 @@ export class DocWorkerApi {
 
     // GET /api/docs/:docId/timings
     // Checks if timing is on for the document.
-    this._app.get("/api/docs/:docId/timing", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.get("/api/docs/:docId/timing", isOwnerRead, withDoc(async (activeDoc, req, res) => {
       if (!activeDoc.isTimingOn) {
         res.json({ status: "disabled" });
       } else {
@@ -1543,7 +1595,7 @@ export class DocWorkerApi {
 
     // POST /api/docs/:docId/timings/start
     // Start a timing for the document.
-    this._app.post("/api/docs/:docId/timing/start", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/timing/start", isOwnerRead, withDoc(async (activeDoc, req, res) => {
       if (activeDoc.isTimingOn) {
         res.status(400).json({ error: `Timing already started for ${activeDoc.docName}` });
         return;
@@ -1555,7 +1607,7 @@ export class DocWorkerApi {
 
     // POST /api/docs/:docId/timings/stop
     // Stop a timing for the document.
-    this._app.post("/api/docs/:docId/timing/stop", isOwner, withDoc(async (activeDoc, req, res) => {
+    this._app.post("/api/docs/:docId/timing/stop", isOwnerRead, withDoc(async (activeDoc, req, res) => {
       if (!activeDoc.isTimingOn) {
         res.status(400).json({ error: `Timing not started for ${activeDoc.docName}` });
         return;
@@ -1572,7 +1624,8 @@ export class DocWorkerApi {
       withDoc,
       checkOwner: this._isOwner.bind(this),
       middlewares: {
-        isOwner,
+        isOwnerRead,
+        isOwnerWrite,
         canEdit,
       },
     });
@@ -1789,15 +1842,18 @@ export class DocWorkerApi {
     next();
   }
 
-  private async _assertAccess(role: "viewers" | "editors" | "owners" | null, allowRemovedOrDisabled: boolean,
+  private async _assertAccess(role: "viewers" | "editors" | "owners" | null,
+    options: { allowRemovedOrDisabled?: boolean, writes?: boolean },
     req: Request, res: Response, next: NextFunction) {
     const scope = getDocScope(req);
-    allowRemovedOrDisabled = scope.showAll || scope.showRemoved || allowRemovedOrDisabled;
+    const allowRemovedOrDisabled =
+      scope.showAll || scope.showRemoved || Boolean(options.allowRemovedOrDisabled);
     const docAuth = await getOrSetDocAuth(req as RequestWithLogin, this._dbManager, scope.urlId);
     if (role) {
       assertAccess(role, docAuth, {
         allowRemoved: allowRemovedOrDisabled,
-        allowDisabled: allowRemovedOrDisabled });
+        allowDisabled: allowRemovedOrDisabled,
+        writes: options.writes });
     }
     next();
   }
@@ -2405,14 +2461,10 @@ export async function getChanges(
   }
   const actionNums: number[] = states.slice(rightOffset, leftOffset).map(state => state.n);
   const actions = (await activeDoc.getActions(actionNums)).reverse();
-  let totalAction = createEmptyActionSummary();
-  for (const action of actions) {
-    if (!action) { continue; }
-    const summary = summarizeAction(action, {
-      maximumInlineRows: maxRows,
-    });
-    totalAction = concatenateSummaries([totalAction, summary]);
-  }
+  // Combine the per-action summaries into one net diff for the range.
+  // concatenateSummaries drops the changes that cancel out along the way.
+  const totalAction = concatenateSummaries(
+    actions.filter(isNonNullish).map(action => summarizeAction(action, { maximumInlineRows: maxRows })));
   const result: DocStateComparison = {
     left: states[leftOffset],
     right: states[rightOffset],

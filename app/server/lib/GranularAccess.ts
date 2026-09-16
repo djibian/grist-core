@@ -30,7 +30,7 @@ import { DocData } from "app/common/DocData";
 import { UserOverride } from "app/common/DocListAPI";
 import { DocUsageSummary, FilteredDocUsageSummary, UsageRecommendations } from "app/common/DocUsage";
 import { normalizeEmail } from "app/common/emails";
-import { ErrorWithCode } from "app/common/ErrorWithCode";
+import { ErrorWithCode, readOnlyError } from "app/common/ErrorWithCode";
 import { InfoEditor, RuleSet } from "app/common/GranularAccessClause";
 import * as gristTypes from "app/common/gristTypes";
 import { getSetMapValue, isNonNullish, pruneArray } from "app/common/gutil";
@@ -57,7 +57,7 @@ import { IPermissionInfo, mergeMemoSets, MixedPermissionSetWithContext,
 import { TablePermissionSetWithContext } from "app/server/lib/PermissionInfo";
 import { integerParam } from "app/server/lib/requestUtils";
 import { getRelatedRows } from "app/server/lib/RowAccess";
-import { getDocSessionAccess, getDocSessionShare } from "app/server/lib/sessionUtils";
+import { getDocSessionAccess, getDocSessionReadOnlyReason, getDocSessionShare } from "app/server/lib/sessionUtils";
 import { quoteIdent } from "app/server/lib/SQLiteDB";
 
 import cloneDeep from "lodash/cloneDeep";
@@ -941,6 +941,12 @@ export class GranularAccess implements GranularAccessForBundle {
         status: 403,
         accessMode: "fork",
       });
+    }
+
+    // All user edits to a document's contents pass through here. Whole-document operations
+    // do not; ActiveDoc refuses those.
+    if (getDocSessionReadOnlyReason(docSession)) {
+      throw readOnlyError();
     }
 
     // Checks are in no particular order.
@@ -3379,13 +3385,16 @@ function getCensorMethod(tableId: string): (rec: RecordEditor) => void {
   }
 }
 
+// Returns true as soon as some action satisfies `check`, descending into
+// ApplyDocActions/ApplyUndoActions groups.
 function scanActionsRecursively<T extends DocAction | UserAction>(actions: T[],
   check: (action: T) => boolean): boolean {
   for (const a of actions) {
     if (a[0] === "ApplyUndoActions" || a[0] === "ApplyDocActions") {
-      return scanActionsRecursively(a[1] as T[], check);
+      if (scanActionsRecursively(a[1] as T[], check)) { return true; }
+    } else {
+      if (check(a)) { return true; }
     }
-    if (check(a)) { return true; }
   }
   return false;
 }

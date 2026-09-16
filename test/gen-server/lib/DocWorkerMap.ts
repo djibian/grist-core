@@ -707,4 +707,148 @@ describe("DocWorkerMap", function() {
       }
     });
   }
+
+  describe("worker liveness", function() {
+    let workers: DocWorkerMap;
+    let oldEnv: testUtils.EnvironmentSnapshot;
+
+    const workerA: DocWorkerInfo = {
+      id: "aliveTestWorkerA",
+      publicUrl: "http://a.example.com",
+      internalUrl: "http://10.0.0.1:8484",
+    };
+
+    before(function() {
+      oldEnv = new testUtils.EnvironmentSnapshot();
+      // The claim lasts a few turns of the timer that reports it, so its lifetime follows this.
+      process.env.GRIST_DOC_WORKER_UPDATE_LOAD_INTERVAL_MS = "5000";
+      workers = new DocWorkerMap([cli]);
+    });
+
+    after(function() {
+      oldEnv.restore();
+    });
+
+    afterEach(async function() {
+      if (cli) { await cli.flushdbAsync(); }
+    });
+
+    it("says nothing was heard from a registration nothing is behind", async function() {
+      // What a worker killed without deregistering leaves, an entry that looks like any other.
+      await cli.hmsetAsync(`worker-${workerA.id}`, { ...workerA });
+      await cli.saddAsync("workers", workerA.id);
+      assert.isFalse(await workers.isWorkerAlive(workerA.id));
+    });
+
+    it("says nothing was heard once a worker stops saying", async function() {
+      await workers.addWorker(workerA);
+      await workers.recordWorkerAlive(workerA.id);
+      assert.isTrue(await workers.isWorkerAlive(workerA.id));
+      // Left to expire, rather than kept until something clears it. Five turns of the timer that
+      // reports it, which is 25 seconds where the interval is left at its default.
+      assert.equal(await cli.ttlAsync(`worker-${workerA.id}-alive`), 25);
+
+      await cli.delAsync(`worker-${workerA.id}-alive`);
+      assert.isFalse(await workers.isWorkerAlive(workerA.id));
+    });
+
+    it("forgets what a worker said when it goes", async function() {
+      await workers.addWorker(workerA);
+      await workers.recordWorkerAlive(workerA.id);
+
+      await workers.removeWorker(workerA.id);
+      assert.equal(await cli.existsAsync(`worker-${workerA.id}-alive`), 0);
+      assert.isFalse(await workers.isWorkerAlive(workerA.id));
+    });
+
+    it("records the load and the claim in one call", async function() {
+      // The load half is an update of an entry already there, which does nothing at all where the
+      // worker is not in that set, so it is asserted on the key rather than on the call.
+      await workers.addWorker(workerA);
+      await workers.setWorkerAvailability(workerA.id, true);
+
+      await workers.setWorkerLoad(workerA, 0.25);
+      assert.isTrue(await workers.isWorkerAlive(workerA.id));
+      assert.equal(await cli.ttlAsync(`worker-${workerA.id}-alive`), 25);
+      assert.equal(
+        Number(await cli.zscoreAsync("workers-available-by-load-default", workerA.id)), 0.25);
+    });
+  });
+
+  describe("worker registrations", function() {
+    let workers: DocWorkerMap;
+
+    const workerA: DocWorkerInfo = {
+      id: "registeredWorkerA",
+      publicUrl: "http://a.example.com",
+      internalUrl: "http://10.0.0.1:8484",
+    };
+
+    before(function() {
+      workers = new DocWorkerMap([cli]);
+    });
+
+    afterEach(async function() {
+      await cli.flushdbAsync();
+    });
+
+    it("reports nothing when no worker is registered", async function() {
+      assert.deepEqual(await workers.getRegisteredWorkers(), []);
+    });
+
+    it("describes every registered worker", async function() {
+      await workers.addWorker(workerA);
+      await workers.setWorkerAvailability(workerA.id, true);
+      await workers.assignDocWorker("registrationTestDoc");
+
+      const registered = await workers.getRegisteredWorkers();
+      assert.lengthOf(registered, 1);
+      assert.equal(registered[0].info.id, workerA.id);
+      assert.equal(registered[0].info.internalUrl, workerA.internalUrl);
+      assert.isTrue(registered[0].available);
+      assert.equal(registered[0].assignmentCount, 1);
+    });
+
+    it("reports a worker that is registered but not taking documents", async function() {
+      await workers.addWorker(workerA);
+      await workers.setWorkerAvailability(workerA.id, false);
+
+      const registered = await workers.getRegisteredWorkers();
+      assert.lengthOf(registered, 1);
+      assert.isFalse(registered[0].available);
+      assert.equal(registered[0].assignmentCount, 0);
+      // No place in the by-load set means no load to report, as against a load of zero.
+      assert.isUndefined(registered[0].load);
+    });
+
+    it("reports the load the assignment algorithm weighs a worker by", async function() {
+      await workers.addWorker(workerA);
+      await workers.setWorkerAvailability(workerA.id, true);
+      assert.equal((await workers.getRegisteredWorkers())[0].load, 0);
+
+      await workers.setWorkerLoad(workerA, 0.25);
+      // Redis hands scores back as strings, so this catches the parse as much as the plumbing.
+      assert.strictEqual((await workers.getRegisteredWorkers())[0].load, 0.25);
+    });
+
+    it("says whether each worker is still saying it is running", async function() {
+      await workers.addWorker(workerA);
+      await workers.setWorkerAvailability(workerA.id, true);
+      await workers.recordWorkerAlive(workerA.id);
+      assert.isTrue((await workers.getRegisteredWorkers())[0].alive);
+
+      await cli.delAsync(`worker-${workerA.id}-alive`);
+      assert.isFalse((await workers.getRegisteredWorkers())[0].alive);
+    });
+
+    it("reports a worker in the group its availability sits in", async function() {
+      await workers.addWorker({ ...workerA, group: "chosen" });
+      await workers.setWorkerAvailability(workerA.id, true);
+      await workers.setWorkerLoad({ ...workerA, group: "chosen" }, 0.5);
+
+      const registered = await workers.getRegisteredWorkers();
+      assert.equal(registered[0].info.group, "chosen");
+      assert.equal(registered[0].load, 0.5);
+    });
+  });
 });

@@ -1,3 +1,4 @@
+import "app/server/lib/lockdown";
 import { ApiError } from "app/common/ApiError";
 import { ICustomWidget } from "app/common/CustomWidget";
 import { delay } from "app/common/delay";
@@ -939,13 +940,13 @@ export class FlexServer implements GristServer {
     this.addOrg();
     addPluginEndpoints(this, await this._addPluginManager());
 
-    // Serve bundled custom widgets on the plugin endpoint.
+    // Serve custom widgets from plugins on the plugin endpoint.
     const places = getWidgetsInPlugins(this, "");
     if (places.length > 0) {
       // For all widgets served in place, replace any copies of
       // grist-plugin-api.js with this app's version of it.
       // This is perhaps a bit rude, but beats the alternative
-      // of either using inconsistent bundled versions, or
+      // of either using inconsistent versions, or
       // requiring network access.
       this.app.use(/^\/widgets\/.*\/(grist-plugin-api.js)$/, expressWrap(async (req, res) =>
         res.sendFile(req.params[0], { root: getAppPathTo(this.appRoot, "static") })));
@@ -1483,6 +1484,10 @@ export class FlexServer implements GristServer {
         verifyClient: req => verifyCommHttpRequest(req, this._hosts, { preserveOriginalUrl: true }),
       },
     );
+
+    if (!this._socketProxy && isAffirmative(process.env.GRIST_FLEET)) {
+      throw new Error("GRIST_FLEET is set, but this build of Grist has no proxy to honor it.");
+    }
 
     const hasHomeApi = () => this.deps.has("api");
     const hasDocApi = () => this.deps.has("docs");
@@ -2487,6 +2492,10 @@ export class FlexServer implements GristServer {
           await this.createWorkerUrl();
         }
       }
+      // Said before registering, so that a registration never exists without it. The moment
+      // between the two would otherwise show a registration with no word from a worker behind it.
+      // Refreshed from here on by the load tracker, on the timer that reports load.
+      await workers.recordWorkerAlive(this.worker.id);
       await workers.addWorker(this.worker);
       await workers.setWorkerAvailability(this.worker.id, true);
     } catch (err) {
@@ -2498,7 +2507,9 @@ export class FlexServer implements GristServer {
 
   private async _removeSelfAsWorker(workers: IDocWorkerMap, docWorkerId: string) {
     this._healthy = false;
-    this._docWorkerLoadTracker?.stop();
+    // Deregistering matters more than a last report, so a failed one must not stop it.
+    await this._docWorkerLoadTracker?.stopAndFinish().catch(
+      err => log.warn(`DocWorker ${docWorkerId} could not finish reporting itself: ${err}`));
     await workers.removeWorker(docWorkerId);
     if (process.env.GRIST_ROUTER_URL) {
       await axios.get(process.env.GRIST_ROUTER_URL,
@@ -2659,19 +2670,7 @@ export class FlexServer implements GristServer {
     // Only used as {userRoot}/plugins as a place for plugins in addition to {appRoot}/plugins
     const userRoot = path.resolve(process.env.GRIST_USER_ROOT || getAppPathTo(this.appRoot, ".grist"));
     this.info.push(["userRoot", userRoot]);
-    // Some custom widgets may be included as an npm package called @gristlabs/grist-widget.
-    // The package doesn't actually  contain node code, but should be in the same vicinity
-    // as other packages that do, so we can use require.resolve on one of them to find it.
-    // This seems a little overcomplicated, but works well when grist-core is bundled within
-    // a larger project like grist-electron.
-    // TODO: maybe add a little node code to @gristlabs/grist-widget so it can be resolved
-    // directly?
-    const gristLabsModules = path.dirname(path.dirname(require.resolve("@gristlabs/express-session")));
-    const bundledRoot = isAffirmative(process.env.GRIST_SKIP_BUNDLED_WIDGETS) ? undefined : path.join(
-      gristLabsModules, "grist-widget", "dist",
-    );
-    this.info.push(["bundledRoot", bundledRoot]);
-    const pluginManager = new PluginManager(this.appRoot, userRoot, bundledRoot);
+    const pluginManager = new PluginManager(this.appRoot, userRoot);
     // `initialize()` is asynchronous and reads plugins manifests; if PluginManager is used before it
     // finishes, it will act as if there are no plugins.
     // ^ I think this comment was here to justify calling initialize without waiting for

@@ -753,6 +753,7 @@ export class HomeDBManager implements HomeDBAuth {
     qb = qb.addOrderBy("coalesce(prefs.org_id, 0)", "DESC");
     qb = qb.addOrderBy("coalesce(prefs.user_id, 0)", "DESC");
     const result: QueryResult<any> = await this._verifyAclPermissions(qb, {
+      scope,
       markedPermissions: options?.requirePermissions !== undefined,
     });
     if (result.status === 200) {
@@ -1054,6 +1055,24 @@ export class HomeDBManager implements HomeDBAuth {
     return result;
   }
 
+  // Returns whether the user is a non-guest member of at least one org on a paid
+  // plan. Entitlement for paid-only account features (e.g. SMS two-factor auth) is
+  // by org membership rather than by a single org context, since a user may belong
+  // to several orgs. "Paid" is the same calculated flag surfaced elsewhere.
+  //
+  // Guests don't qualify: they are free to add in unlimited numbers (anyone shared
+  // on a single doc becomes one), while non-guest members are seats the org pays
+  // for. Access via a public share with everyone@ doesn't qualify either.
+  public async isUserOnPaidPlan(userId: number): Promise<boolean> {
+    let qb = this._orgs();
+    qb = this._filterByOrgGroups(qb, userId, null, { ignoreEveryoneShares: true });
+    qb = qb.andWhere("groups.name IN (:...nonGuestGroups)",
+      { nonGuestGroups: this.defaultNonGuestGroupNames });
+    qb = this._addBillingAccount(qb, userId);
+    const orgs = await qb.getMany();
+    return orgs.some(org => Boolean(org.billingAccount?.paid));
+  }
+
   // Returns the doc with access information for the calling user only.
   // TODO: The return type of this function includes the workspace and org with the owner
   // properties set, as documented in app/common/UserAPI. The return type of this function
@@ -1165,12 +1184,11 @@ export class HomeDBManager implements HomeDBAuth {
       if (!doc.workspace.org.billingAccount.product) {
         throw new ApiError("billing account has no product", 500);
       }
-      if (this.isReadonly() ||
-        await this.getSiteReadOnlyReason(doc.workspace.org, { manager: transaction })
-      ) {
-        // Don't allow any access to docs that is stronger than "viewers".
-        doc.access = roles.getWeakestRole("viewers", doc.access);
-      }
+      // Record that the document is held read-only; don't weaken the role to impose it. The
+      // role governs reading, access rules and downloads, which should not be affected.
+      // Edits are refused in GranularAccess.checkUserActions.
+      doc.readOnlyReason = this.isReadonly() ? "installRestricted" :
+        await this.getSiteReadOnlyReason(doc.workspace.org, { manager: transaction });
       // Place ownership information in the doc's workspace.
       (doc.workspace as any).owner = doc.workspace.org.owner;
     }
@@ -1204,6 +1222,9 @@ export class HomeDBManager implements HomeDBAuth {
     const promise = this.getDocImpl(key, transaction);
     await mapSetOrClear(this._docAuthCache, stringifyDocAuthKey(key), makeDocAuthResult(promise));
     const doc = await promise;
+    if (scope.filter?.([doc]).length === 0) {
+      throw new ApiError("document not found", 404);
+    }
     // Filter the result for removed / non-removed documents.
     if (!scope.showAll && (scope.showRemoved ?
       (doc.removedAt === null && doc.workspace.removedAt === null) :
@@ -2469,6 +2490,7 @@ export class HomeDBManager implements HomeDBAuth {
       return {
         ...this.makeFullUser(u),
         loginEmail: undefined,    // Not part of PermissionData.
+        disabledReason: undefined,  // Only the disabled user and admins get to know the reason.
         access,
         isMember: access !== "guests",
       };
@@ -2526,6 +2548,7 @@ export class HomeDBManager implements HomeDBAuth {
       return {
         ...this.makeFullUser(u),
         loginEmail: undefined,    // Not part of PermissionData.
+        disabledReason: undefined,  // Only the disabled user and admins get to know the reason.
         access: wsMap[u.id] || null,
         parentAccess: roles.getEffectiveRole(orgMap[u.id] || null),
         isMember: orgAccess && orgAccess !== "guests",
@@ -2611,6 +2634,7 @@ export class HomeDBManager implements HomeDBAuth {
         ...this.makeFullUser(u),
         firstLoginAt: undefined, // Not part of PermissionData.
         loginEmail: undefined,    // Not part of PermissionData.
+        disabledReason: undefined,  // Only the disabled user and admins get to know the reason.
         access: docMap[u.id] || null,
         parentAccess: roles.getEffectiveRole(
           roles.getStrongestRole(wsMap[u.id] || null, inheritFromOrg),
@@ -3059,17 +3083,18 @@ export class HomeDBManager implements HomeDBAuth {
     return await this._getOrCreateLimitAndReset(accountId, limitType, false);
   }
 
-  public async removeLimit(scope: Scope, limitType: LimitType): Promise<void> {
-    await this._connection.transaction(async (manager) => {
-      const org = await this._org(scope, false, scope.org ?? null, { manager, needRealOrg: true })
-        .innerJoinAndSelect("orgs.billingAccount", "billing_account")
-        .innerJoinAndSelect("billing_account.product", "product")
-        .leftJoinAndSelect("billing_account.limits", "limit", "limit.type = :limitType", { limitType })
-        .getOne();
-      const existing = org?.billingAccount?.limits?.[0];
-      if (existing) {
-        await manager.remove(existing);
-      }
+  public async removeLimit(
+    accountId: number,
+    limitType: LimitType,
+    transaction?: EntityManager,
+  ): Promise<void> {
+    await this.runInTransaction(transaction, async (manager) => {
+      await manager.createQueryBuilder()
+        .delete()
+        .from(Limit)
+        .where("billing_account_id = :accountId", { accountId })
+        .andWhere("type = :limitType", { limitType })
+        .execute();
     });
   }
 
@@ -3712,7 +3737,7 @@ export class HomeDBManager implements HomeDBAuth {
     const { urlId: docId, userId } = scope;
     const docQb = this._doc(scope, { accessStyle: "openNoPublic", manager });
     // The following combination throws ApiError for insufficient access.
-    const doc = this.unwrapQueryResult(await this._verifyAclPermissions(docQb))[0];
+    const doc = this.unwrapQueryResult(await this._verifyAclPermissions(docQb, { scope }))[0];
 
     const records = await manager.createQueryBuilder()
       .select("doc_pref")
@@ -5659,9 +5684,11 @@ export async function makeDocAuthResult(docPromise: Promise<Document>): Promise<
     const doc = await docPromise;
     const removed = Boolean(doc.removedAt || doc.workspace.removedAt);
     const disabled = Boolean(doc.disabledAt);
-    return { docId: doc.id, access: doc.access, removed, disabled, cachedDoc: doc };
+    return { docId: doc.id, access: doc.access, removed, disabled,
+      readOnlyReason: doc.readOnlyReason ?? null, cachedDoc: doc };
   } catch (error) {
-    return { docId: null, access: null, removed: null, disabled: null, error };
+    return { docId: null, access: null, removed: null, disabled: null,
+      readOnlyReason: null, error };
   }
 }
 

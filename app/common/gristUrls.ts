@@ -12,7 +12,6 @@ import { TelemetryLevel } from "app/common/Telemetry";
 import { ThemeAppearance, themeAppearances, ThemeName, themeNames } from "app/common/ThemePrefs";
 import { getGristConfig } from "app/common/urlUtils";
 import { Document, PublicDocWorkerUrlInfo } from "app/common/UserAPI";
-import { IAttachedCustomWidget } from "app/common/widgetTypes";
 import { UIRowId } from "app/plugin/GristAPI";
 
 import clone from "lodash/clone";
@@ -149,6 +148,7 @@ export const getCommonUrls = () => withAdminDefinedUrls({
   helpTeamAuditLogs: "https://support.getgrist.com/install/audit-log-overview/",
   helpTelemetryLimited: "https://support.getgrist.com/telemetry-limited",
   helpEnterpriseOptIn: "https://support.getgrist.com/self-managed/#how-do-i-enable-the-full-edition-of-grist",
+  helpEmailNotifications: "https://support.getgrist.com/self-managed/#how-do-i-set-up-email-notifications",
   activationKeyRequestForm: "https://www.getgrist.com/request-activation-key",
   freeActivationKeyFaq: "https://www.getgrist.com/free-grist-activation-key-faq/",
   helpCalendarWidget: "https://support.getgrist.com/widget-calendar",
@@ -1000,8 +1000,6 @@ export interface GristLoadConfig {
 
   assistant?: AssistantConfig;
 
-  permittedCustomWidgets?: IAttachedCustomWidget[];
-
   // Email address of the support user.
   supportEmail?: string;
 
@@ -1182,9 +1180,8 @@ export function getTermsOfServiceUrl(): string | undefined {
   return getCustomizableValue("termsOfServiceUrl", "GRIST_TERMS_OF_SERVICE_URL") || undefined;
 }
 
-export function getFreeCoachingCallUrl(): string {
-  const defaultUrl = "https://calendly.com/grist-team/grist-free-coaching-call";
-  return getCustomizableValue("freeCoachingCallUrl", "FREE_COACHING_CALL_URL") || defaultUrl;
+export function getFreeCoachingCallUrl(): string | undefined {
+  return getCustomizableValue("freeCoachingCallUrl", "FREE_COACHING_CALL_URL") || undefined;
 }
 
 export function getContactSupportUrl(): string {

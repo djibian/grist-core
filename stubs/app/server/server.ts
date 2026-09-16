@@ -4,6 +4,8 @@
  * By default, starts up on port 8484.
  */
 
+import "app/server/lib/lockdown";
+
 import { normalizeEmail } from "app/common/emails";
 import { commonUrls } from "app/common/gristUrls";
 import { isAffirmative } from "app/common/gutil";
@@ -219,7 +221,7 @@ export async function main() {
   setDefaultEnv("GRIST_SERVERS", "home,docs,static");
   if (process.env.GRIST_SERVERS?.includes("home")) {
     // By default, we will now start an untrusted port alongside a
-    // home server, for bundled custom widgets.
+    // home server, for custom widgets served from plugins.
     // Suppress with GRIST_UNTRUSTED_PORT=''
     setDefaultEnv("GRIST_UNTRUSTED_PORT", "0");
   }
